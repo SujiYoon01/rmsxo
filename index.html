@@ -1,1 +1,272 @@
-ddd
+# -*- coding: utf-8 -*-
+"""
+근무시간 분석 자동화 스크립트
+------------------------------------------------
+사용법:
+    python 근무시간_분석.py 로우데이터.xlsx
+
+입력:
+    - 엑셀(xlsx) 원본 파일 1개 (A~V열 구조, 헤더는 1행)
+출력:
+    - dashboard.html  (같은 폴더에 생성됨. 더블클릭해서 브라우저로 열면 됨)
+
+* 인터넷 연결이 있는 브라우저에서 열어야 그래프가 정상적으로 보입니다.
+  (Chart.js 라이브러리를 CDN에서 불러오기 때문)
+"""
+
+import sys
+import json
+import pandas as pd
+
+# ------------------------------------------------------------------
+# 0. 설정값 (필요하면 여기만 수정하면 됩니다)
+# ------------------------------------------------------------------
+INPUT_PATH = sys.argv[1] if len(sys.argv) > 1 else "로우데이터.xlsx"
+OUTPUT_PATH = "dashboard.html"
+
+EXCLUDE_구분 = ["근태예외자"]          # 분석에서 제외할 '구분' 값
+DEPT_REMAP = {                          # 부서명 통합 규칙
+    "제조팀": "제주우주센터",
+    "체계기술2팀": "제주우주센터",
+}
+
+# ------------------------------------------------------------------
+# 1. 데이터 로드 & 전처리
+# ------------------------------------------------------------------
+def load_and_clean(path: str) -> pd.DataFrame:
+    df = pd.read_excel(path)
+
+    # 1) 근태예외자 제외
+    df = df[~df["구분"].isin(EXCLUDE_구분)].copy()
+
+    # 2) 부서명 통합 (제조팀, 체계기술2팀 -> 제주우주센터)
+    df["부서명"] = df["부서명"].replace(DEPT_REMAP)
+
+    # 3) 주확정근무시간: 분 -> 시간, 소수점 첫째자리
+    df["주확정근무시간_시간"] = (df["주확정근무시간"] / 60).round(1)
+
+    return df
+
+
+# ------------------------------------------------------------------
+# 2. 개인별 월평균 근무시간 (사번 기준으로 1~4주차 평균)
+# ------------------------------------------------------------------
+def build_personal_avg(df: pd.DataFrame) -> pd.DataFrame:
+    personal = (
+        df.groupby(["사번", "이름", "부서명"], as_index=False)["주확정근무시간_시간"]
+        .mean()
+        .rename(columns={"주확정근무시간_시간": "월평균근무시간"})
+    )
+    personal["월평균근무시간"] = personal["월평균근무시간"].round(1)
+    return personal
+
+
+# ------------------------------------------------------------------
+# 3. 부서별 통계 (팀별 비교용 막대그래프 + 4사분면용)
+# ------------------------------------------------------------------
+def build_dept_stats(personal: pd.DataFrame) -> pd.DataFrame:
+    dept = (
+        personal.groupby("부서명")["월평균근무시간"]
+        .agg(부서평균="mean", 부서표준편차="std", 인원수="count")
+        .reset_index()
+    )
+    # 인원이 1명뿐인 부서는 표준편차가 NaN으로 나옴 -> 0으로 처리
+    dept["부서표준편차"] = dept["부서표준편차"].fillna(0)
+    dept["부서평균"] = dept["부서평균"].round(1)
+    dept["부서표준편차"] = dept["부서표준편차"].round(2)
+    return dept.sort_values("부서평균", ascending=False)
+
+
+# ------------------------------------------------------------------
+# 4. HTML 대시보드 생성
+# ------------------------------------------------------------------
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>근무시간 분석 대시보드</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
+<style>
+  body { font-family: -apple-system, "Malgun Gothic", sans-serif; margin: 24px; color: #222; background:#f7f8fa; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 17px; margin-top: 40px; border-left: 4px solid #4c6ef5; padding-left: 8px; }
+  .card { background:#fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 24px; }
+  canvas { max-width: 100%; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: center; }
+  th { cursor: pointer; background:#fafafa; position: sticky; top:0; }
+  select, input { padding: 6px; margin-bottom: 10px; }
+  .tag { display:inline-block; padding:2px 8px; border-radius: 999px; background:#eef1ff; color:#4c6ef5; font-size:12px; margin-left:6px;}
+</style>
+</head>
+<body>
+
+<h1>근무시간 분석 대시보드</h1>
+
+<h2>1. 부서별 평균 근무시간 비교</h2>
+<div class="card">
+  <canvas id="deptBarChart" height="110"></canvas>
+</div>
+
+<h2>2. 근무시간 4사분면 (X: 부서 평균 근무시간, Y: 부서 내 편차)</h2>
+<div class="card">
+  <canvas id="quadrantChart" height="110"></canvas>
+  <p style="font-size:12px;color:#888;">
+    점선은 전체 부서 평균값 기준입니다. 우측 상단(1사분면)일수록 해당 부서의 평균 근무시간이 길고,
+    동시에 부서 내 인원들 간 근무시간 편차도 크다는 뜻입니다(= 부서 내 업무량이 특정 인원에게 쏠렸을 가능성).
+  </p>
+</div>
+
+<h2>3. 개인별 근무시간</h2>
+<div class="card">
+  <select id="deptFilter"></select>
+  <input id="searchBox" placeholder="이름 검색">
+  <table id="personalTable">
+    <thead>
+      <tr>
+        <th data-key="사번">사번</th>
+        <th data-key="이름">이름</th>
+        <th data-key="부서명">부서명</th>
+        <th data-key="월평균근무시간">월평균근무시간(시간)</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const deptStats = __DEPT_STATS__;
+const personalData = __PERSONAL_DATA__;
+
+// --- 1. 부서별 막대그래프 ---
+new Chart(document.getElementById('deptBarChart'), {
+  type: 'bar',
+  data: {
+    labels: deptStats.map(d => d.부서명),
+    datasets: [{
+      label: '부서 평균 근무시간(시간)',
+      data: deptStats.map(d => d.부서평균),
+      backgroundColor: '#4c6ef5'
+    }]
+  },
+  options: {
+    plugins: { legend: { display: false } },
+    scales: { y: { title: { display: true, text: '시간' } } }
+  }
+});
+
+// --- 2. 4사분면 산점도 ---
+const avgX = deptStats.reduce((s, d) => s + d.부서평균, 0) / deptStats.length;
+const avgY = deptStats.reduce((s, d) => s + d.부서표준편차, 0) / deptStats.length;
+
+new Chart(document.getElementById('quadrantChart'), {
+  type: 'scatter',
+  data: {
+    datasets: [{
+      label: '부서',
+      data: deptStats.map(d => ({ x: d.부서평균, y: d.부서표준편차, label: d.부서명 })),
+      backgroundColor: '#f76707',
+      pointRadius: 6
+    }]
+  },
+  options: {
+    plugins: {
+      legend: { display: false },
+      datalabels: {
+        align: 'top',
+        formatter: (v) => v.label,
+        font: { size: 11 },
+        color: '#333'
+      },
+      annotation: {}
+    },
+    scales: {
+      x: { title: { display: true, text: '부서 평균 근무시간(시간)' } },
+      y: { title: { display: true, text: '부서 내 표준편차' } }
+    }
+  },
+  plugins: [ChartDataLabels, {
+    id: 'quadrantLines',
+    afterDraw: (chart) => {
+      const {ctx, scales:{x, y}} = chart;
+      ctx.save();
+      ctx.strokeStyle = '#bbb';
+      ctx.setLineDash([4,4]);
+      const xPix = x.getPixelForValue(avgX);
+      const yPix = y.getPixelForValue(avgY);
+      ctx.beginPath(); ctx.moveTo(xPix, chart.chartArea.top); ctx.lineTo(xPix, chart.chartArea.bottom); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(chart.chartArea.left, yPix); ctx.lineTo(chart.chartArea.right, yPix); ctx.stroke();
+      ctx.restore();
+    }
+  }]
+});
+
+// --- 3. 개인별 테이블 ---
+const tbody = document.querySelector('#personalTable tbody');
+const deptFilter = document.getElementById('deptFilter');
+const searchBox = document.getElementById('searchBox');
+
+const depts = [...new Set(personalData.map(p => p.부서명))].sort();
+deptFilter.innerHTML = '<option value="">전체 부서</option>' + depts.map(d => `<option value="${d}">${d}</option>`).join('');
+
+let sortKey = '월평균근무시간', sortAsc = false;
+
+function render() {
+  const dept = deptFilter.value;
+  const q = searchBox.value.trim();
+  let rows = personalData.filter(p =>
+    (!dept || p.부서명 === dept) && (!q || p.이름.includes(q))
+  );
+  rows.sort((a, b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    const cmp = typeof av === 'number' ? av - bv : String(av).localeCompare(String(bv));
+    return sortAsc ? cmp : -cmp;
+  });
+  tbody.innerHTML = rows.map(p => `
+    <tr><td>${p.사번}</td><td>${p.이름}</td><td>${p.부서명}</td><td>${p.월평균근무시간}</td></tr>
+  `).join('');
+}
+
+document.querySelectorAll('#personalTable th').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.key;
+    sortAsc = (sortKey === key) ? !sortAsc : false;
+    sortKey = key;
+    render();
+  });
+});
+deptFilter.addEventListener('change', render);
+searchBox.addEventListener('input', render);
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def build_html(dept_stats: pd.DataFrame, personal: pd.DataFrame) -> str:
+    html = HTML_TEMPLATE
+    html = html.replace("__DEPT_STATS__", json.dumps(dept_stats.to_dict("records"), ensure_ascii=False))
+    html = html.replace("__PERSONAL_DATA__", json.dumps(personal.to_dict("records"), ensure_ascii=False))
+    return html
+
+
+# ------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------
+def main():
+    df = load_and_clean(INPUT_PATH)
+    personal = build_personal_avg(df)
+    dept_stats = build_dept_stats(personal)
+
+    html = build_html(dept_stats, personal)
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"완료: {OUTPUT_PATH} 생성됨 (부서 {len(dept_stats)}개, 인원 {len(personal)}명)")
+
+
+if __name__ == "__main__":
+    main()
+
