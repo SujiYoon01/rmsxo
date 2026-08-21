@@ -8,7 +8,7 @@
   :root{
     --c1:#35578C; --c2:#6C8FC4; --c3:#A9C3E6; --c4:#E3EDF9;
     --dark:#1E3358; --bg:#F7F9FC; --card:#FFFFFF; --border:#E4E7EC;
-    --text:#101828; --sub:#667085; --mute:#98A2B3; --pos:#1F9E89; --neg:#E4572E; --gold:#D9A441;
+    --text:#101828; --sub:#667085; --mute:#98A2B3; --pos:#1F9E89; --neg:#E4572E; --gold:#D9A441; --avgred:#B5534B
   }
   *{ box-sizing:border-box; margin:0; padding:0; }
   html,body{ background:var(--bg); }
@@ -141,6 +141,8 @@
 /* ===== 0. 설정 ===== */
 const EXCLUDE_구분 = ['근태예외자'];
 const DEPT_REMAP = { '제조팀':'제주우주센터', '체계기술2팀':'제주우주센터' };
+const EXCLUDE_직급 = ['상무', '전무', '부사장'];
+const MIN_HOURS = 40;
 const REQUIRED_COLUMNS = ['구분','년월','주차','사번','이름','부서명','주확정근무시간'];
 
 const state = { personal: [], deptStats: [], avgX: 0, avgY: 0 };
@@ -174,7 +176,10 @@ function onRawFile(file){
 
 /* ===== 2. 데이터 처리 (전처리 -> 개인별 -> 부서별) ===== */
 function processData(rows){
-  const cleaned = rows.filter(r => !EXCLUDE_구분.includes(String(r['구분']).trim()));
+  const cleaned = rows.filter(r =>
+  !EXCLUDE_구분.includes(String(r['구분']).trim()) &&
+  !EXCLUDE_직급.includes(String(r['직급']).trim())
+);
   cleaned.forEach(r=>{
     const dept = String(r['부서명']).trim();
     r['부서명'] = DEPT_REMAP[dept] || dept;
